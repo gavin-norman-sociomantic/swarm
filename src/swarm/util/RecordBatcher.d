@@ -275,6 +275,63 @@ public class RecordBatcher : RecordBatchBase
 
     /***************************************************************************
 
+        Checks whether the specified value plus the given number of extra bytes
+        would fit in the currently available free space in the batch.
+
+        Params:
+            value = value to check
+            extra_bytes = number of bytes to store in addition to value
+
+        Returns:
+            true if the key/value would fit in the current free space, false if
+            they're too big
+
+    ***************************************************************************/
+
+    public bool fits ( cstring value, size_t extra_bytes )
+    {
+        bool will_never_fit;
+        return this.fits(value, extra_bytes, will_never_fit);
+    }
+
+
+    /***************************************************************************
+
+        Checks whether the specified value plus the given number of extra bytes
+        would fit in the currently available free space in the batch. Also
+        returns, via an out parameter, whether it is impossible for this data to
+        fit in the batch, even when it's empty.
+
+        Params:
+            value = value to check
+            extra_bytes = number of bytes to store in addition to value
+            will_never_fit = output value, set to true if the key/value are
+                larger than the batch buffer's dimension (meaning that the
+                key/value can never fit in the batch, even when it's empty)
+
+        Returns:
+            true if the key/value would fit in the current free space, false if
+            they're too big
+
+    ***************************************************************************/
+
+    public bool fits ( cstring value, size_t extra_bytes, out bool will_never_fit )
+    out ( f )
+    {
+        if ( will_never_fit )
+        {
+            assert(!f);
+        }
+    }
+    body
+    {
+        auto size = this.batchedSize(value) + extra_bytes;
+        return this.fits(size, will_never_fit);
+    }
+
+
+    /***************************************************************************
+
         Adds a value to the batch.
 
         Params:
@@ -330,6 +387,40 @@ public class RecordBatcher : RecordBatchBase
         Const!(ubyte[]) value_len_str = (cast(ubyte*)&value_len)[0..size_t.sizeof];
 
         this.batch.append(key_len_str, cast(Const!(ubyte[]))key, value_len_str,
+            cast(Const!(ubyte[]))value);
+
+        return AddResult.Added;
+    }
+
+
+    /***************************************************************************
+
+        Adds a (hash_t) key/value pair to the batch.
+
+        Params:
+            key = key to add
+            value = value to add
+
+        Returns:
+            code indicating result of add
+
+    ***************************************************************************/
+
+    public AddResult add ( hash_t key, cstring value )
+    {
+        bool will_never_fit;
+        if ( !this.fits(value, key.sizeof, will_never_fit) )
+        {
+            return will_never_fit ? AddResult.TooBig : AddResult.BatchFull;
+        }
+
+        Const!(ubyte[]) key_slice = (cast(ubyte*)(&key))[0..key.sizeof];
+
+        size_t value_len = value.length;
+        Const!(ubyte[]) value_len_slice =
+            (cast(ubyte*)&value_len)[0..size_t.sizeof];
+
+        this.batch.append(key_slice, value_len_slice,
             cast(Const!(ubyte[]))value);
 
         return AddResult.Added;
@@ -563,6 +654,136 @@ public class RecordBatch : RecordBatchBase
         }
 
         return r;
+    }
+
+
+    /***************************************************************************
+
+        Extracts a single value from the batch.
+
+        Params:
+            consumed = progress through the batch buffer, updated as a value is
+                extracted
+
+        Returns:
+            slice to extracted value
+
+    ***************************************************************************/
+
+    private cstring extractValue ( ref size_t consumed )
+    {
+        size_t len = *(cast(size_t*)(this.batch.ptr + consumed));
+        consumed += size_t.sizeof;
+
+        auto value = cast(mstring) this.batch[consumed .. consumed + len];
+        consumed += len;
+
+        return value;
+    }
+}
+
+
+/*******************************************************************************
+
+    Class to decompress and extract records with hash_t keys from batches.
+
+    A compressed batch should be passed to the decompress() method. Following
+    decompression, the opApply() method may be called to extract the values
+    contained in the batch.
+
+*******************************************************************************/
+
+public class HashTKeyRecordBatch : RecordBatchBase
+{
+    /***************************************************************************
+
+        Constructor.
+
+        Params:
+            lzo = lzo de/compressor to use
+            batch_size = batch size to use
+
+    ***************************************************************************/
+
+    public this ( Lzo lzo, size_t batch_size = DefaultMaxBatchSize )
+    {
+        super(lzo, batch_size);
+    }
+
+
+    /***************************************************************************
+
+        Decompresses the provided compressed data into this batch. The data
+        buffer is assumed to have been written by RecordBatcher.compress().
+
+        Following decompression, either of the extract() methods can be used to
+        retrieve the individual records stored in the batch.
+
+        Params:
+            compressed = buffer containing compressed data
+
+    ***************************************************************************/
+
+    public void decompress ( in ubyte[] compressed )
+    {
+        // Read uncompressed length from first size_t.sizeof bytes.
+        auto uncompressed_len = *(cast(size_t*)(compressed.ptr));
+        assert(uncompressed_len <= this.batch.dimension);
+        this.batch.length = uncompressed_len;
+
+        // Decompress into this.batch.
+        auto src = compressed[size_t.sizeof .. $];
+        this.lzo.uncompress(src, this.batch[]);
+    }
+
+
+    /***************************************************************************
+
+        foreach iteration. Extracts all key/value pairs from the batch, calling
+        the provided delegate once per pair.
+
+        Params:
+            record_dg = delegate to call for each extracted value pair
+
+    ***************************************************************************/
+
+    public int opApply (
+        int delegate ( ref hash_t key, ref cstring value ) record_dg )
+    {
+        int r;
+        size_t consumed;
+
+        while ( consumed < this.batch.length )
+        {
+            auto key = this.extractKey(consumed);
+            auto value = this.extractValue(consumed);
+            r = record_dg(key, value);
+            if ( r ) break;
+        }
+
+        return r;
+    }
+
+
+    /***************************************************************************
+
+        Extracts a single key from the batch.
+
+        Params:
+            consumed = progress through the batch buffer, updated as a value is
+                extracted
+
+        Returns:
+            extracted key
+
+    ***************************************************************************/
+
+    private hash_t extractKey ( ref size_t consumed )
+    {
+        auto key = *(cast(hash_t*)(this.batch.ptr + consumed));
+        consumed += hash_t.sizeof;
+
+        return key;
     }
 
 
